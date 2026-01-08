@@ -262,14 +262,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, ch chan bool) {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	if ok {
+		ch <- reply.VoteGranted
+	} else {
+		ch <- false
+	}
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -318,6 +321,56 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		rf.mu.Lock()
+		if rf.state == Follower || rf.state == Candidate {
+			elapsed := time.Since(rf.lastHeardFromLeader)
+			if elapsed >= time.Duration(800)*time.Millisecond || rf.state == Candidate {
+				// 超过选举超时时间，转换为候选人，发起新一轮选举
+				rf.state = Candidate
+				rf.currentTerm += 1
+				rf.votedFor = rf.me
+
+				// 发送RequestVote RPC
+				ch := make(chan bool)
+				for i := range rf.peers {
+					if i != rf.me && rf.state == Candidate && !rf.killed() {
+						args := &RequestVoteArgs{}
+						args.Term = rf.currentTerm
+						args.CandidateId = rf.me
+						// 其他字段暂时不填充
+						reply := &RequestVoteReply{}
+
+						go rf.sendRequestVote(i, args, reply, ch)
+					}
+				}
+				if rf.state != Candidate {
+					continue
+				}
+
+				// 等待投票结果
+				voteCount := 1
+				totalPeers := len(rf.peers)
+				for i := 0; i < totalPeers-1; i++ {
+					voteGranted := <-ch
+					if voteGranted {
+						voteCount += 1
+					}
+					// 获得多数选票，转换为Leader
+					if voteCount > totalPeers/2 && rf.state == Candidate {
+						rf.state = Leader
+						// 初始化Leader的volatile状态
+						for j := range rf.peers {
+							rf.nextIndex[j] = rf.commitIndex + 1
+							rf.matchIndex[j] = 0
+						}
+						break
+					}
+				}
+			}
+			rf.mu.Unlock()
+		} else {
+			rf.mu.Unlock()
+		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
@@ -327,22 +380,35 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) sendHeartbeat() {
-	for rf.killed() == false {
+	heartbeatInterval := 200 * time.Millisecond
+	checkInterval := 10 * time.Millisecond
+
+	for !rf.killed() {
+		rf.mu.Lock()
 		if rf.state == Leader {
-			// 发送心跳包
+			term := rf.currentTerm
+			peers := make([]int, 0, len(rf.peers)-1)
 			for i := range rf.peers {
 				if i != rf.me {
-					args := &AppendEntriesArgs{}
-					args.Term = rf.currentTerm
-					args.LeaderId = rf.me
-					// 其他字段暂时不填充
-					reply := &AppendEntriesReply{}
-
-					go rf.sendAppendEntries(i, args, reply)
+					peers = append(peers, i)
 				}
 			}
-			// 心跳间隔200ms
-			time.Sleep(200 * time.Millisecond)
+			rf.mu.Unlock()
+
+			// 批量发送心跳
+			for _, peer := range peers {
+				args := &AppendEntriesArgs{
+					Term:     term,
+					LeaderId: rf.me,
+				}
+				reply := &AppendEntriesReply{}
+				go rf.sendAppendEntries(peer, args, reply)
+			}
+
+			time.Sleep(heartbeatInterval)
+		} else {
+			rf.mu.Unlock()
+			time.Sleep(checkInterval)
 		}
 	}
 }
