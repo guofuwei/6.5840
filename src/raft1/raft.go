@@ -161,8 +161,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) getLastLogTerm() int {
@@ -243,6 +245,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
 		return
 	}
 	// 如果收到的任期号比当前任期号大，更新当前任期号，并转换为跟随者
@@ -261,6 +265,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.state != Follower {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
 		return
 	}
 	// 处理日志
@@ -268,10 +274,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 日志不匹配，拒绝请求
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
 	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// 日志不匹配，拒绝请求
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+
+		index := args.PrevLogIndex - 1
+		// 找到第一个不匹配的任期
+		for index > 0 {
+			if rf.log[index].Term != reply.ConflictTerm {
+				break
+			}
+			index--
+		}
+		reply.ConflictIndex = index + 1
 	} else {
 		// 心跳包或者日志匹配，开始处理 Entries
 
@@ -520,11 +539,6 @@ func (rf *Raft) sendAppendRPC() {
 							return
 						}
 
-						if len(args.Entries) == 0 {
-							// 心跳包不处理后续逻辑
-							return
-						}
-
 						if reply.Success {
 							// 【重点修复】使用 args 中的信息来更新，而不是 len(rf.log)
 							match := args.PrevLogIndex + len(args.Entries)
@@ -533,10 +547,43 @@ func (rf *Raft) sendAppendRPC() {
 								rf.nextIndex[p] = match + 1
 							}
 						} else {
-							// 简单的回退策略（Lab2C可以优化这里）
-							if rf.nextIndex[p] > 1 {
-								rf.nextIndex[p]--
+							// 快速回退-方法一，主要应对少量Term大量log的冲突情况
+							// index := args.PrevLogIndex
+							// // 找到第一个不匹配的任期
+							// for index > 0 {
+							// 	if rf.log[index].Term != args.PrevLogTerm {
+							// 		break
+							// 	}
+							// 	index--
+							// }
+							// rf.nextIndex[p] = max(1, index+1)
+
+							// 快速回退-方法二，主要应对大量Term少量log的冲突情况
+							if reply.ConflictTerm == -1 {
+								rf.nextIndex[p] = reply.ConflictIndex
+							} else {
+								// 尝试在 Leader 日志中找到 ConflictTerm
+								lastIndexOfTerm := -1
+								for i := len(rf.log) - 1; i >= 0; i-- {
+									if rf.log[i].Term == reply.ConflictTerm {
+										lastIndexOfTerm = i
+										break
+									}
+								}
+
+								if lastIndexOfTerm != -1 {
+									// Leader 也有这个 Term，尝试从该 Term 之后继续
+									rf.nextIndex[p] = lastIndexOfTerm + 1
+								} else {
+									// Leader 没有这个 Term，说明 Follower 该 Term 的日志全是错的，全部跳过
+									rf.nextIndex[p] = reply.ConflictIndex
+								}
 							}
+							// 兜底，防止越界
+							if rf.nextIndex[p] < 1 {
+								rf.nextIndex[p] = 1
+							}
+
 						}
 					}(peer, args)
 				}
