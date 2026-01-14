@@ -8,12 +8,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -89,32 +91,36 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("readPersist decode error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -190,6 +196,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
+		rf.persist()
 	}
 	// 如果当前领导者还活着，拒绝投票
 	elapsed := time.Since(rf.lastHeardFromLeader)
@@ -234,7 +241,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 	}
-
+	rf.persist()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -254,12 +261,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
+		rf.persist()
 	}
 	// 下面处理args.Term == rf.currentTerm的情况
 	// 如果是Candidate，转换为Follower
 	if rf.state == Candidate {
 		rf.state = Follower
 		rf.votedFor = args.LeaderId
+		rf.persist()
 	}
 	// 只有Follower才处理心跳包
 	if rf.state != Follower {
@@ -337,6 +346,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 更新收到心跳包的时间
 	rf.lastHeardFromLeader = time.Now()
 	rf.votedFor = args.LeaderId
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -404,6 +414,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.log = append(rf.log, newEntry)
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -439,6 +450,7 @@ func (rf *Raft) heartbeatTicker() {
 				rf.state = Candidate
 				rf.currentTerm += 1
 				rf.votedFor = rf.me
+				rf.persist()
 
 				voteCount := 1
 				// 发送RequestVote RPC
@@ -466,6 +478,7 @@ func (rf *Raft) heartbeatTicker() {
 								rf.currentTerm = reply.Term
 								rf.state = Follower
 								rf.votedFor = -1
+								rf.persist()
 								return
 							}
 
@@ -479,6 +492,7 @@ func (rf *Raft) heartbeatTicker() {
 										rf.nextIndex[j] = len(rf.log)
 										rf.matchIndex[j] = 0
 									}
+									rf.persist()
 									return
 								}
 							}
@@ -536,6 +550,7 @@ func (rf *Raft) sendAppendRPC() {
 							rf.currentTerm = reply.Term
 							rf.state = Follower
 							rf.votedFor = -1
+							rf.persist()
 							return
 						}
 
@@ -585,6 +600,7 @@ func (rf *Raft) sendAppendRPC() {
 							}
 
 						}
+						rf.persist()
 					}(peer, args)
 				}
 			}
