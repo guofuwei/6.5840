@@ -545,7 +545,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 
 	term = rf.currentTerm
 	index = rf.p2lIndex(len(rf.log))
@@ -561,6 +560,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.log = append(rf.log, newEntry)
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -577,6 +577,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	close(rf.applyCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -835,6 +836,9 @@ func (rf *Raft) logCommitAndApplyTicker() {
 
 		// 应用到状态机（在锁外进行）
 		for _, msg := range allApplyMsgs {
+			if rf.killed() {
+				return
+			}
 			rf.applyCh <- msg
 		}
 		// 每隔10毫秒检查一次

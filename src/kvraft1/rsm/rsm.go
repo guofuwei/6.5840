@@ -1,25 +1,26 @@
 package rsm
 
 import (
+	"fmt"
 	"sync"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
-
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me  int
+	Id  int
+	Req any
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -41,6 +42,14 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	waitApplyChs map[int]chan Notification
+	currentReqId int
+}
+
+// 新增一个结构体用于在 Channel 中传递结果
+type Notification struct {
+	OpId   int
+	Result any // 存放 DoOp 的返回值
 }
 
 // servers[] contains the ports of the set of
@@ -64,17 +73,19 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		waitApplyChs: make(map[int]chan Notification),
+		currentReqId: 0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.ReceiveApplyCh()
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -86,5 +97,64 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	rsm.mu.Lock()
+	op := Op{Me: rsm.me, Id: rsm.currentReqId, Req: req}
+	rsm.currentReqId++
+	ch := make(chan Notification, 1)
+	rsm.waitApplyChs[op.Id] = ch
+	rsm.mu.Unlock()
+	_, _, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		close(ch)
+		rsm.mu.Lock()
+		delete(rsm.waitApplyChs, op.Id)
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+
+	// wait for apply
+	notify, ok := <-ch
+	if !ok {
+		return rpc.ErrWrongLeader, nil
+	}
+	// 检查是否还是领导者
+	_, isLeader = rsm.rf.GetState()
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+	if notify.OpId != op.Id {
+		return rpc.ErrWrongLeader, nil
+	}
+	return rpc.OK, notify.Result
+}
+
+func (rsm *RSM) ReceiveApplyCh() {
+	for {
+		msg, ok := <-rsm.applyCh
+		if !ok {
+			for _, ch := range rsm.waitApplyChs {
+				close(ch)
+			}
+			return
+		}
+		if msg.CommandValid {
+			op, ok := msg.Command.(Op)
+			if !ok {
+				// 处理类型转换失败的情况
+				fmt.Println("some error in rsm ReceiveApplyCh")
+			}
+			// 所有节点都需要执行状态机
+			result := rsm.sm.DoOp(op.Req)
+			// 只有Leader节点需要通知
+			rsm.mu.Lock()
+			ch, exists := rsm.waitApplyChs[op.Id]
+			if exists {
+				delete(rsm.waitApplyChs, op.Id)
+				rsm.mu.Unlock()
+				ch <- Notification{OpId: op.Id, Result: result}
+			} else {
+				rsm.mu.Unlock()
+			}
+		}
+	}
 }
