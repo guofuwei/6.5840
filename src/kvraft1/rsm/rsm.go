@@ -2,7 +2,9 @@ package rsm
 
 import (
 	"fmt"
+	"math/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -43,7 +45,6 @@ type RSM struct {
 	sm           StateMachine
 	// Your definitions here.
 	waitApplyChs map[int]chan Notification
-	currentReqId int
 }
 
 // 新增一个结构体用于在 Channel 中传递结果
@@ -74,7 +75,6 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
 		waitApplyChs: make(map[int]chan Notification),
-		currentReqId: 0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -98,12 +98,12 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 	// your code here
 	rsm.mu.Lock()
-	op := Op{Me: rsm.me, Id: rsm.currentReqId, Req: req}
-	rsm.currentReqId++
+	opId := int(time.Now().UnixNano()) + rand.Int()
+	op := Op{Me: rsm.me, Id: opId, Req: req}
 	ch := make(chan Notification, 1)
 	rsm.waitApplyChs[op.Id] = ch
 	rsm.mu.Unlock()
-	_, _, isLeader := rsm.rf.Start(op)
+	_, term, isLeader := rsm.rf.Start(op)
 	if !isLeader {
 		close(ch)
 		rsm.mu.Lock()
@@ -112,29 +112,46 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		return rpc.ErrWrongLeader, nil
 	}
 
-	// wait for apply
-	notify, ok := <-ch
-	if !ok {
-		return rpc.ErrWrongLeader, nil
+	// 循环轮询等待，直到 Apply 成功 OR Term 发生变化 OR 不再是 Leader
+	for {
+		select {
+		case notify, ok := <-ch:
+			if !ok {
+				return rpc.ErrWrongLeader, nil
+			}
+			if notify.OpId != op.Id {
+				return rpc.ErrWrongLeader, nil
+			}
+			return rpc.OK, notify.Result
+
+		case <-time.After(10 * time.Millisecond): // 每 10ms 检查一次状态
+			currentTerm, isLeader := rsm.rf.GetState()
+
+			// 如果不再是 Leader，或者 Term 变了（说明只要之前没 commit，现在肯定 commit 不了了）
+			if !isLeader || currentTerm != term {
+				rsm.mu.Lock()
+				delete(rsm.waitApplyChs, op.Id)
+				rsm.mu.Unlock()
+				return rpc.ErrWrongLeader, nil
+			}
+
+			// 还有一个情况：如果我们依然是 Leader，Term 也没变，
+			// 但是 Log 已经被压缩了（Snapshot），或者 Index 处的 Log 变成了别人的？
+			// 这种情况比较少见，通常 Term 变化就足够覆盖 Partion healing 的情况了。
+		}
 	}
-	// 检查是否还是领导者
-	_, isLeader = rsm.rf.GetState()
-	if !isLeader {
-		return rpc.ErrWrongLeader, nil
-	}
-	if notify.OpId != op.Id {
-		return rpc.ErrWrongLeader, nil
-	}
-	return rpc.OK, notify.Result
 }
 
 func (rsm *RSM) ReceiveApplyCh() {
 	for {
 		msg, ok := <-rsm.applyCh
 		if !ok {
-			for _, ch := range rsm.waitApplyChs {
+			rsm.mu.Lock()
+			for opId, ch := range rsm.waitApplyChs {
+				delete(rsm.waitApplyChs, opId)
 				close(ch)
 			}
+			rsm.mu.Unlock()
 			return
 		}
 		if msg.CommandValid {
@@ -148,7 +165,7 @@ func (rsm *RSM) ReceiveApplyCh() {
 			// 只有Leader节点需要通知
 			rsm.mu.Lock()
 			ch, exists := rsm.waitApplyChs[op.Id]
-			if exists {
+			if exists && op.Me == rsm.me {
 				delete(rsm.waitApplyChs, op.Id)
 				rsm.mu.Unlock()
 				ch <- Notification{OpId: op.Id, Result: result}

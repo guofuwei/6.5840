@@ -80,7 +80,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	isleader = (rf.state == Leader)
+	isleader = (rf.state == Leader && !rf.killed())
 	return term, isleader
 }
 
@@ -455,6 +455,11 @@ func (rf *Raft) InstallSnapshotHandler(args *InstallSnapshotArgs, reply *Install
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
+		if rf.killed() {
+			close(rf.applyCh)
+			rf.mu.Unlock()
+			return
+		}
 		rf.mu.Unlock()
 		rf.applyCh <- applyMsg
 		rf.mu.Lock()
@@ -550,7 +555,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.p2lIndex(len(rf.log))
 
 	// 不是领导者，返回false
-	if rf.state != Leader {
+	if rf.killed() || rf.state != Leader {
 		isLeader = false
 		return index, term, isLeader
 	}
@@ -577,7 +582,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	close(rf.applyCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -662,7 +666,7 @@ func (rf *Raft) logAppendTicker() {
 	heartbeatInterval := HeartbeatInterval * time.Millisecond
 	checkInterval := 10 * time.Millisecond
 
-	for !rf.killed() {
+	for rf.killed() == false {
 		rf.mu.Lock()
 		if rf.state == Leader {
 			// 批量发送心跳（包含日志信息）
@@ -804,7 +808,7 @@ func (rf *Raft) logAppendTicker() {
 // 日志提交与应用协程
 func (rf *Raft) logCommitAndApplyTicker() {
 	// 注意：appleMsg不能在goroutine内发送，否则可能会死锁，而且没有保证顺序的应用状态机
-	for !rf.killed() {
+	for rf.killed() == false {
 		rf.mu.Lock()
 		if rf.state == Leader {
 			// 检查是否有新的日志可以提交
@@ -823,7 +827,7 @@ func (rf *Raft) logCommitAndApplyTicker() {
 		// 对于所有的Raft节点，应用已提交的日志到状态机
 		// 统计需要的applyMsg
 		allApplyMsgs := []raftapi.ApplyMsg{}
-		for rf.lastApplied < rf.commitIndex {
+		for rf.killed() == false && rf.lastApplied < rf.commitIndex {
 			rf.lastApplied += 1
 			applyMsg := raftapi.ApplyMsg{
 				CommandValid: true,
@@ -836,9 +840,13 @@ func (rf *Raft) logCommitAndApplyTicker() {
 
 		// 应用到状态机（在锁外进行）
 		for _, msg := range allApplyMsgs {
+			rf.mu.Lock()
 			if rf.killed() {
+				close(rf.applyCh)
+				rf.mu.Unlock()
 				return
 			}
+			rf.mu.Unlock()
 			rf.applyCh <- msg
 		}
 		// 每隔10毫秒检查一次
