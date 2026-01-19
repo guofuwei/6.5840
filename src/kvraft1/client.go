@@ -1,21 +1,26 @@
 package kvraft
 
 import (
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
-)
+	"time"
 
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
+)
 
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	// You will have to modify this struct.
+	leaderIdx int
+	clientId  int64
+	requestId int64
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, servers: servers}
+	ck := &Clerk{clnt: clnt, servers: servers, leaderIdx: 0}
 	// You'll have to add code here.
+	ck.clientId = time.Now().UnixNano()
 	return ck
 }
 
@@ -30,9 +35,31 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
+	args := &rpc.GetArgs{Key: key}
 
-	// You will have to modify this function.
-	return "", 0, ""
+	for {
+		var reply rpc.GetReply
+		ok := ck.clnt.Call(ck.servers[ck.leaderIdx], "KVServer.Get", args, &reply)
+
+		if ok {
+			switch reply.Err {
+			case rpc.OK:
+				return reply.Value, reply.Version, rpc.OK
+			case rpc.ErrNoKey:
+				return "", 0, rpc.ErrNoKey
+			case rpc.ErrWrongLeader:
+				// 尝试下一个服务器
+				ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
+			default:
+				// 其他错误，尝试下一个服务器
+				ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
+			}
+		} else {
+			// RPC 失败，尝试下一个服务器
+			ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -53,6 +80,34 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+	args := &rpc.PutArgs{Key: key, Value: value, Version: version, ClientId: ck.clientId, RequestId: ck.requestId}
+	ck.requestId += 1
+	firstAttempt := true
+
+	for {
+		var reply rpc.PutReply
+		ok := ck.clnt.Call(ck.servers[ck.leaderIdx], "KVServer.Put", args, &reply)
+
+		if ok {
+			switch reply.Err {
+			case rpc.OK:
+				return rpc.OK
+			case rpc.ErrNoKey:
+				return rpc.ErrNoKey
+			case rpc.ErrVersion:
+				if firstAttempt {
+					return rpc.ErrVersion
+				}
+				return rpc.ErrMaybe
+			case rpc.ErrWrongLeader:
+				ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
+			default:
+				ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
+			}
+		} else {
+			firstAttempt = false
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }

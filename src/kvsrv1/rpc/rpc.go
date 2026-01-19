@@ -22,6 +22,12 @@ type PutArgs struct {
 	Key     string
 	Value   string
 	Version Tversion
+
+	// for kvraft lab
+	// ClientId is an unique identifier for each client
+	ClientId int64
+	// RequestId is a monotonically increasing number for each request from a client
+	RequestId int64
 }
 
 type PutReply struct {
@@ -37,4 +43,3 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
-

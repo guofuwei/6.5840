@@ -45,12 +45,20 @@ type RSM struct {
 	sm           StateMachine
 	// Your definitions here.
 	waitApplyChs map[int]chan Notification
+	// 防止客户端重复提交
+	lastRecvOps map[int64]OpResult // map[clientId]Result
 }
 
 // 新增一个结构体用于在 Channel 中传递结果
 type Notification struct {
 	OpId   int
 	Result any // 存放 DoOp 的返回值
+}
+
+type OpResult struct {
+	RequestId int64
+	Err       rpc.Err
+	Result    any
 }
 
 // servers[] contains the ports of the set of
@@ -97,6 +105,18 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
+	// 首先验证是否为重复提交
+	if clientOp, ok := req.(rpc.PutArgs); ok {
+		rsm.mu.Lock()
+		if lastReq, exists := rsm.lastRecvOps[clientOp.ClientId]; exists && clientOp.RequestId <= lastReq.RequestId {
+			// 已经执行过该请求，直接返回 OK 和 nil 结果
+			rsm.mu.Unlock()
+			return lastReq.Err, lastReq.Result
+		}
+		rsm.mu.Unlock()
+	}
+
+	// 提交给 Raft 并等待提交完成
 	rsm.mu.Lock()
 	opId := int(time.Now().UnixNano()) + rand.Int()
 	op := Op{Me: rsm.me, Id: opId, Req: req}
@@ -111,6 +131,21 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
+
+	// 更新lastAppliedOps以防止重复提交
+	defer func() {
+		if clientOp, ok := req.(rpc.PutArgs); ok {
+			rsm.mu.Lock()
+			if lastReq, exists := rsm.lastRecvOps[clientOp.ClientId]; !exists || clientOp.RequestId > lastReq.RequestId {
+				rsm.lastRecvOps[clientOp.ClientId] = OpResult{
+					RequestId: clientOp.RequestId,
+					Err:       rpc.OK,
+					Result:    nil,
+				}
+			}
+			rsm.mu.Unlock()
+		}
+	}()
 
 	// 循环轮询等待，直到 Apply 成功 OR Term 发生变化 OR 不再是 Leader
 	for {
@@ -147,10 +182,10 @@ func (rsm *RSM) ReceiveApplyCh() {
 		msg, ok := <-rsm.applyCh
 		if !ok {
 			rsm.mu.Lock()
-			for opId, ch := range rsm.waitApplyChs {
-				delete(rsm.waitApplyChs, opId)
+			for _, ch := range rsm.waitApplyChs {
 				close(ch)
 			}
+			rsm.waitApplyChs = make(map[int]chan Notification)
 			rsm.mu.Unlock()
 			return
 		}

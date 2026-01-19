@@ -51,6 +51,8 @@ type Raft struct {
 	state               RaftState
 	lastHeardFromLeader time.Time
 	applyCh             chan raftapi.ApplyMsg
+
+	triggerAE chan bool // 新增: 用于触发立即发送 AppendEntries 的信号通道
 }
 
 type RaftState int
@@ -67,8 +69,8 @@ type LogEntry struct {
 }
 
 const (
-	ElectionTimeout   = 600 // milliseconds
-	HeartbeatInterval = 200 // milliseconds
+	ElectionTimeout   = 300 // milliseconds
+	HeartbeatInterval = 100 // milliseconds
 )
 
 // return currentTerm and whether this server
@@ -455,12 +457,11 @@ func (rf *Raft) InstallSnapshotHandler(args *InstallSnapshotArgs, reply *Install
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
+		rf.mu.Unlock()
 		if rf.killed() {
 			close(rf.applyCh)
-			rf.mu.Unlock()
 			return
 		}
-		rf.mu.Unlock()
 		rf.applyCh <- applyMsg
 		rf.mu.Lock()
 
@@ -567,6 +568,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, newEntry)
 	rf.persist()
 
+	// 只要 Buffer 没满就通知 logAppendTicker 立即工作
+	select {
+	case rf.triggerAE <- true:
+	default:
+	}
+
 	return index, term, isLeader
 }
 
@@ -668,7 +675,8 @@ func (rf *Raft) logAppendTicker() {
 
 	for rf.killed() == false {
 		rf.mu.Lock()
-		if rf.state == Leader {
+		isLeader := (rf.state == Leader)
+		if isLeader {
 			// 批量发送心跳（包含日志信息）
 			for peer := range rf.peers {
 				if peer != rf.me && !rf.killed() && rf.state == Leader {
@@ -796,11 +804,28 @@ func (rf *Raft) logAppendTicker() {
 					}(peer, args)
 				}
 			}
-			rf.mu.Unlock()
-			time.Sleep(heartbeatInterval)
-		} else {
-			rf.mu.Unlock()
-			time.Sleep(checkInterval)
+
+		}
+		rf.mu.Unlock()
+		// 计算等待时间：Leader 等待心跳间隔，Follower 等待检查间隔
+		timeout := checkInterval
+		if isLeader {
+			timeout = heartbeatInterval
+		}
+
+		// 使用 select 等待超时或新日志触发
+		timer := time.NewTimer(timeout)
+		select {
+		case <-rf.triggerAE:
+			// 立即触发下一次循环，发送 AppendEntries
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			// 超时，正常触发心跳
 		}
 	}
 }
@@ -812,7 +837,7 @@ func (rf *Raft) logCommitAndApplyTicker() {
 		rf.mu.Lock()
 		if rf.state == Leader {
 			// 检查是否有新的日志可以提交
-			for lIndex := rf.commitIndex + 1; lIndex < rf.p2lIndex(len(rf.log)); lIndex++ {
+			for lIndex := rf.p2lIndex(len(rf.log)) - 1; lIndex > rf.commitIndex; lIndex-- {
 				count := 1
 				for i := range rf.peers {
 					if i != rf.me && rf.matchIndex[i] >= lIndex {
@@ -821,6 +846,7 @@ func (rf *Raft) logCommitAndApplyTicker() {
 				}
 				if count > len(rf.peers)/2.0 && rf.log[rf.l2pIndex(lIndex)].Term == rf.currentTerm {
 					rf.commitIndex = lIndex
+					break
 				}
 			}
 		}
@@ -840,13 +866,10 @@ func (rf *Raft) logCommitAndApplyTicker() {
 
 		// 应用到状态机（在锁外进行）
 		for _, msg := range allApplyMsgs {
-			rf.mu.Lock()
 			if rf.killed() {
 				close(rf.applyCh)
-				rf.mu.Unlock()
 				return
 			}
-			rf.mu.Unlock()
 			rf.applyCh <- msg
 		}
 		// 每隔10毫秒检查一次
@@ -894,6 +917,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 	rf.snapshot = nil
+
+	rf.triggerAE = make(chan bool, 1)
 
 	// initialize from state persisted before a crash
 	rf.mu.Lock()
