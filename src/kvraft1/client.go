@@ -84,9 +84,12 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	ck.requestId += 1
 	firstAttempt := true
 
+	tryNum := 1
+
 	for {
 		var reply rpc.PutReply
 		ok := ck.clnt.Call(ck.servers[ck.leaderIdx], "KVServer.Put", args, &reply)
+		// fmt.Printf("Recv reply from server,ok:%v\n,reply:%v\n", ok, reply)
 
 		if ok {
 			switch reply.Err {
@@ -105,7 +108,15 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 				ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
 			}
 		} else {
-			firstAttempt = false
+			tryNum++
+			if tryNum == 3 {
+				tryNum = 1
+				ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
+				firstAttempt = true
+			} else {
+				firstAttempt = false
+
+			}
 		}
 
 		time.Sleep(10 * time.Millisecond)

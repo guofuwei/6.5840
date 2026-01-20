@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 
@@ -17,9 +18,10 @@ type KVServer struct {
 	rsm  *rsm.RSM
 
 	// Your definitions here.
-	mu   sync.Mutex
-	kv   map[string]string
-	kver map[string]rpc.Tversion
+	mu      sync.Mutex
+	kv      map[string]string
+	kver    map[string]rpc.Tversion
+	lastOps map[int64]OpResult
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -27,6 +29,12 @@ type KVServer struct {
 //
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
+
+type OpResult struct {
+	RequestId int64
+	Result    any
+}
+
 func (kv *KVServer) DoOp(req any) any {
 	// Your code here
 	switch args := req.(type) {
@@ -48,6 +56,11 @@ func (kv *KVServer) DoOp(req any) any {
 	case rpc.PutArgs:
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
+		// 避免重复的请求
+		if lastOp, found := kv.lastOps[args.ClientId]; found && args.RequestId == lastOp.RequestId {
+			return lastOp.Result
+		}
+
 		_, ok := kv.kv[args.Key]
 		reply := &rpc.PutReply{}
 		if !ok {
@@ -68,6 +81,11 @@ func (kv *KVServer) DoOp(req any) any {
 				reply.Err = rpc.OK
 			}
 		}
+		// 记录最后的操作结果
+		kv.lastOps[args.ClientId] = OpResult{
+			RequestId: args.RequestId,
+			Result:    reply,
+		}
 		return reply
 	}
 	return nil
@@ -75,11 +93,34 @@ func (kv *KVServer) DoOp(req any) any {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
+	e.Encode(kv.kv)
+	e.Encode(kv.kver)
+	e.Encode(kv.lastOps)
+	kv.mu.Unlock()
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvMap map[string]string
+	var kvVerMap map[string]rpc.Tversion
+	var lastOps map[int64]OpResult
+	if d.Decode(&kvMap) != nil ||
+		d.Decode(&kvVerMap) != nil ||
+		d.Decode(&lastOps) != nil {
+		panic("Failed to decode KVServer snapshot")
+	} else {
+		kv.mu.Lock()
+		kv.kv = kvMap
+		kv.kver = kvVerMap
+		kv.lastOps = lastOps
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -143,6 +184,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	// You may need initialization code here.
 	kv.kv = make(map[string]string)
 	kv.kver = make(map[string]rpc.Tversion)
+	kv.lastOps = make(map[int64]OpResult)
+	labgob.Register(&rpc.PutReply{})
+	labgob.Register(&rpc.GetReply{})
 
 	return []tester.IService{kv, kv.rsm.Raft()}
 }
