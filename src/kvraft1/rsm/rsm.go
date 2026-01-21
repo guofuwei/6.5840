@@ -44,7 +44,8 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	waitApplyChs map[int]chan Notification
+	waitApplyChs   map[int]chan Notification
+	lastAppliedIdx int
 }
 
 // 新增一个结构体用于在 Channel 中传递结果
@@ -70,16 +71,20 @@ type Notification struct {
 // any long-running work.
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
-		me:           me,
-		maxraftstate: maxraftstate,
-		applyCh:      make(chan raftapi.ApplyMsg),
-		sm:           sm,
-		waitApplyChs: make(map[int]chan Notification),
+		me:             me,
+		maxraftstate:   maxraftstate,
+		applyCh:        make(chan raftapi.ApplyMsg),
+		sm:             sm,
+		waitApplyChs:   make(map[int]chan Notification),
+		lastAppliedIdx: 0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
-	go rsm.ReceiveApplyCh()
+	if (persister.ReadSnapshot() != nil) && (len(persister.ReadSnapshot()) > 0) {
+		rsm.sm.Restore(persister.ReadSnapshot())
+	}
+	go rsm.ReceiveApplyChTicker()
 	return rsm
 }
 
@@ -143,7 +148,8 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	}
 }
 
-func (rsm *RSM) ReceiveApplyCh() {
+func (rsm *RSM) ReceiveApplyChTicker() {
+	threshold := int(0.9 * float64(rsm.maxraftstate))
 	for {
 		msg, ok := <-rsm.applyCh
 		if !ok {
@@ -163,8 +169,8 @@ func (rsm *RSM) ReceiveApplyCh() {
 			}
 			// 所有节点都需要执行状态机
 			result := rsm.sm.DoOp(op.Req)
-			// 只有Leader节点需要通知
 			rsm.mu.Lock()
+			// 只有Leader节点需要通知等待的客户端
 			ch, exists := rsm.waitApplyChs[op.Id]
 			if exists && op.Me == rsm.me {
 				delete(rsm.waitApplyChs, op.Id)
@@ -173,6 +179,19 @@ func (rsm *RSM) ReceiveApplyCh() {
 			} else {
 				rsm.mu.Unlock()
 			}
+			// 检查是否需要做快照
+			rsm.mu.Lock()
+			rsm.lastAppliedIdx = msg.CommandIndex
+			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > threshold {
+				snapshot := rsm.sm.Snapshot()
+				rsm.rf.Snapshot(rsm.lastAppliedIdx, snapshot)
+			}
+			rsm.mu.Unlock()
+		} else if msg.SnapshotValid {
+			rsm.mu.Lock()
+			rsm.sm.Restore(msg.Snapshot)
+			rsm.lastAppliedIdx = msg.SnapshotIndex
+			rsm.mu.Unlock()
 		}
 	}
 }

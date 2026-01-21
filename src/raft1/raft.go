@@ -450,6 +450,7 @@ func (rf *Raft) InstallSnapshotHandler(args *InstallSnapshotArgs, reply *Install
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 	} else {
+		rf.mu.Unlock()
 		// 安装快照
 		applyMsg := raftapi.ApplyMsg{
 			SnapshotValid: true,
@@ -457,18 +458,19 @@ func (rf *Raft) InstallSnapshotHandler(args *InstallSnapshotArgs, reply *Install
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
-		rf.mu.Unlock()
 		if rf.killed() {
 			close(rf.applyCh)
 			return
 		}
 		rf.applyCh <- applyMsg
-		rf.mu.Lock()
 
+		rf.mu.Lock()
 		reply.Term = rf.currentTerm
 		// 截断过期的日志
 		pIndex := rf.l2pIndex(args.LastIncludedIndex)
-		if pIndex < len(rf.log) && rf.log[pIndex].Term == args.LastIncludedTerm {
+		// fmt.Printf("InstallSnapshot: lastIncludedIndex=%d, lastIncludedTerm=%d, pIndex=%d, logLen=%d\n",
+		// 	args.LastIncludedIndex, args.LastIncludedTerm, pIndex, len(rf.log))
+		if 0 <= pIndex && pIndex < len(rf.log) && rf.log[pIndex].Term == args.LastIncludedTerm {
 			// 保留快照之后的日志
 			newLog := make([]LogEntry, 1)
 			newLog[0] = LogEntry{

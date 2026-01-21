@@ -87,8 +87,9 @@ func (kv *KVServer) DoOp(req any) any {
 			Result:    reply,
 		}
 		return reply
+	default:
+		panic("Unknown operation type")
 	}
-	return nil
 }
 
 func (kv *KVServer) Snapshot() []byte {
@@ -177,16 +178,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(&rpc.PutReply{})
+	labgob.Register(&rpc.GetReply{})
 
 	kv := &KVServer{me: me}
 
-	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
-	// You may need initialization code here.
 	kv.kv = make(map[string]string)
 	kv.kver = make(map[string]rpc.Tversion)
 	kv.lastOps = make(map[int64]OpResult)
-	labgob.Register(&rpc.PutReply{})
-	labgob.Register(&rpc.GetReply{})
+	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 
 	return []tester.IService{kv, kv.rsm.Raft()}
 }
