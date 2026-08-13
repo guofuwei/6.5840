@@ -110,6 +110,15 @@ func (kv *KVServer) DoOp(req any) any {
 			return reply
 		}
 		if args.Num == shard.Num {
+			if shard.Status == shardAbsent {
+				// A recovering controller may replay the whole transfer after
+				// this source already completed DeleteShard.  The matching
+				// destination must already have installed the shard, so an
+				// empty successful reply lets Install/Delete be replayed
+				// idempotently without retaining deleted data here.
+				reply.Err = rpc.OK
+				return reply
+			}
 			if shard.Status != shardFrozen {
 				reply.Err = rpc.ErrWrongGroup
 				return reply

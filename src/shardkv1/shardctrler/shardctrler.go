@@ -15,7 +15,10 @@ import (
 	"6.5840/tester1"
 )
 
-const currentConfigKey = "shardctrler-current-config"
+const (
+	currentConfigKey = "shardctrler-current-config"
+	nextConfigKey    = "shardctrler-next-config"
+)
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -40,6 +43,16 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 // controller. In part A, this method doesn't need to do anything. In
 // B and C, this method implements recovery.
 func (sck *ShardCtrler) InitController() {
+	current, currentVersion := sck.mustReadConfig(currentConfigKey)
+	next, _, err := sck.readConfig(nextConfigKey)
+	if err == rpc.ErrNoKey {
+		return
+	}
+	if err != rpc.OK || next.Num != current.Num+1 {
+		return
+	}
+
+	sck.finishConfigChange(current, currentVersion, next)
 }
 
 // Called once by the tester to supply the first configuration.  You
@@ -48,24 +61,11 @@ func (sck *ShardCtrler) InitController() {
 // pick the key to name the configuration.  The initial configuration
 // lists shardgrp shardcfg.Gid1 for all shards.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
-	want := cfg.String()
-	for {
-		err := sck.IKVClerk.Put(currentConfigKey, want, 0)
-		if err == rpc.OK {
-			return
-		}
-
-		// A lost Put reply is ambiguous.  Read the key back before
-		// retrying so that an already successful initialization is not
-		// mistaken for an ErrVersion failure.
-		if err == rpc.ErrMaybe || err == rpc.ErrVersion {
-			got, _, getErr := sck.readConfig()
-			if getErr == rpc.OK && got.String() == want {
-				return
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Keeping next initialized to current gives every later change a
+	// durable, versioned slot in which to announce its intent before it
+	// starts moving shards.
+	sck.putConfig(currentConfigKey, cfg, 0)
+	sck.putConfig(nextConfigKey, cfg, 0)
 }
 
 // Called by the tester to ask the controller to change the
@@ -73,10 +73,7 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // changes the configuration it may be superseded by another
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
-	old, version, err := sck.readConfig()
-	if err != rpc.OK {
-		return
-	}
+	old, version := sck.mustReadConfig(currentConfigKey)
 	if old.Num == new.Num && old.String() == new.String() {
 		return
 	}
@@ -84,6 +81,29 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		return
 	}
 
+	next, nextVersion, nextErr := sck.readConfig(nextConfigKey)
+	if nextErr == rpc.OK && next.Num > old.Num {
+		// Another controller (or an earlier invocation) already announced
+		// the next configuration.  Only help if it is the same change.
+		if next.String() == new.String() {
+			sck.finishConfigChange(old, version, next)
+		}
+		return
+	}
+	if nextErr != rpc.OK && nextErr != rpc.ErrNoKey {
+		return
+	}
+	if nextErr == rpc.ErrNoKey {
+		nextVersion = 0
+	}
+	if !sck.putConfig(nextConfigKey, new, nextVersion) {
+		return
+	}
+
+	sck.finishConfigChange(old, version, new)
+}
+
+func (sck *ShardCtrler) finishConfigChange(old *shardcfg.ShardConfig, oldVersion rpc.Tversion, new *shardcfg.ShardConfig) {
 	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
 		oldGID := old.Shards[shard]
 		newGID := new.Shards[shard]
@@ -121,44 +141,45 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 
 	// The old configuration remains visible while shards move.  Publish
 	// the new one only after every move has completed.
-	for {
-		putErr := sck.IKVClerk.Put(currentConfigKey, new.String(), version)
-		if putErr == rpc.OK {
-			return
-		}
-		if putErr == rpc.ErrMaybe || putErr == rpc.ErrVersion {
-			current, currentVersion, getErr := sck.readConfig()
-			if getErr != rpc.OK {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			if current.Num == new.Num && current.String() == new.String() {
-				return
-			}
-			if current.Num != old.Num {
-				return
-			}
-			version = currentVersion
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	sck.putConfig(currentConfigKey, new, oldVersion)
 }
 
 // Return the current configuration
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
+	cfg, _ := sck.mustReadConfig(currentConfigKey)
+	return cfg
+}
+
+func (sck *ShardCtrler) readConfig(key string) (*shardcfg.ShardConfig, rpc.Tversion, rpc.Err) {
+	value, version, err := sck.IKVClerk.Get(key)
+	if err != rpc.OK {
+		return nil, version, err
+	}
+	return shardcfg.FromString(value), version, rpc.OK
+}
+
+func (sck *ShardCtrler) mustReadConfig(key string) (*shardcfg.ShardConfig, rpc.Tversion) {
 	for {
-		cfg, _, err := sck.readConfig()
+		cfg, version, err := sck.readConfig(key)
 		if err == rpc.OK {
-			return cfg
+			return cfg, version
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func (sck *ShardCtrler) readConfig() (*shardcfg.ShardConfig, rpc.Tversion, rpc.Err) {
-	value, version, err := sck.IKVClerk.Get(currentConfigKey)
-	if err != rpc.OK {
-		return nil, version, err
+// putConfig performs a versioned write and resolves an ambiguous reply by
+// reading the key back.  It returns false when some other value won the
+// version race.
+func (sck *ShardCtrler) putConfig(key string, cfg *shardcfg.ShardConfig, version rpc.Tversion) bool {
+	want := cfg.String()
+	err := sck.IKVClerk.Put(key, want, version)
+	if err == rpc.OK {
+		return true
 	}
-	return shardcfg.FromString(value), version, rpc.OK
+	if err != rpc.ErrMaybe && err != rpc.ErrVersion {
+		return false
+	}
+	got, _, getErr := sck.readConfig(key)
+	return getErr == rpc.OK && got.String() == want
 }
