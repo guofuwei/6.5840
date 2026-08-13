@@ -1,7 +1,6 @@
 package rsm
 
 import (
-	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -111,7 +110,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Unlock()
 	_, term, isLeader := rsm.rf.Start(op)
 	if !isLeader {
-		close(ch)
 		rsm.mu.Lock()
 		delete(rsm.waitApplyChs, op.Id)
 		rsm.mu.Unlock()
@@ -164,8 +162,15 @@ func (rsm *RSM) ReceiveApplyChTicker() {
 		if msg.CommandValid {
 			op, ok := msg.Command.(Op)
 			if !ok {
-				// 处理类型转换失败的情况
-				fmt.Println("some error in rsm ReceiveApplyCh")
+				// Raft may expose the nil sentinel at a snapshot boundary.
+				// The snapshot already contains its state, so advance the
+				// applied index without sending nil to the state machine.
+				rsm.mu.Lock()
+				if msg.CommandIndex > rsm.lastAppliedIdx {
+					rsm.lastAppliedIdx = msg.CommandIndex
+				}
+				rsm.mu.Unlock()
+				continue
 			}
 			// 所有节点都需要执行状态机
 			result := rsm.sm.DoOp(op.Req)
