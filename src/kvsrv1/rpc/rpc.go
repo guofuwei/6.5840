@@ -14,6 +14,9 @@ const (
 	// For future kvraft lab
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrWrongGroup  = "ErrWrongGroup"
+	// ErrStaleConfig is returned by shard migration RPCs only when the
+	// request's configuration number is older than the shard's number.
+	ErrStaleConfig = "ErrStaleConfig"
 )
 
 type Tversion uint64

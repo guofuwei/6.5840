@@ -103,7 +103,9 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	sck.finishConfigChange(old, version, new)
 }
 
-func (sck *ShardCtrler) finishConfigChange(old *shardcfg.ShardConfig, oldVersion rpc.Tversion, new *shardcfg.ShardConfig) {
+// finishConfigChange returns false when the durable current/next records show
+// that this target has completed or lost the configuration race.
+func (sck *ShardCtrler) finishConfigChange(old *shardcfg.ShardConfig, oldVersion rpc.Tversion, new *shardcfg.ShardConfig) bool {
 	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
 		oldGID := old.Shards[shard]
 		newGID := new.Shards[shard]
@@ -115,10 +117,13 @@ func (sck *ShardCtrler) finishConfigChange(old *shardcfg.ShardConfig, oldVersion
 		if oldServers, ok := old.Groups[oldGID]; ok {
 			ck := shardgrp.MakeClerk(sck.clnt, oldServers)
 			for {
-				var freezeErr rpc.Err
-				state, freezeErr = ck.FreezeShard(shard, new.Num)
-				if freezeErr == rpc.OK {
+				var err rpc.Err
+				state, err = ck.FreezeShard(shard, new.Num)
+				if err == rpc.OK {
 					break
+				}
+				if !sck.shouldRetryMigration(new) {
+					return false
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -126,14 +131,28 @@ func (sck *ShardCtrler) finishConfigChange(old *shardcfg.ShardConfig, oldVersion
 
 		if newServers, ok := new.Groups[newGID]; ok {
 			ck := shardgrp.MakeClerk(sck.clnt, newServers)
-			for ck.InstallShard(shard, state, new.Num) != rpc.OK {
+			for {
+				err := ck.InstallShard(shard, state, new.Num)
+				if err == rpc.OK {
+					break
+				}
+				if !sck.shouldRetryMigration(new) {
+					return false
+				}
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
 
 		if oldServers, ok := old.Groups[oldGID]; ok {
 			ck := shardgrp.MakeClerk(sck.clnt, oldServers)
-			for ck.DeleteShard(shard, new.Num) != rpc.OK {
+			for {
+				err := ck.DeleteShard(shard, new.Num)
+				if err == rpc.OK {
+					break
+				}
+				if !sck.shouldRetryMigration(new) {
+					return false
+				}
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
@@ -141,7 +160,34 @@ func (sck *ShardCtrler) finishConfigChange(old *shardcfg.ShardConfig, oldVersion
 
 	// The old configuration remains visible while shards move.  Publish
 	// the new one only after every move has completed.
-	sck.putConfig(currentConfigKey, new, oldVersion)
+	return sck.putConfig(currentConfigKey, new, oldVersion)
+}
+
+// shouldRetryMigration decides controller ownership from the durable
+// configuration records, never from the shard's local state alone. A
+// same-target failure may be a transient RPC failure or an incomplete replay;
+// stopping there would leave next ahead of current forever, so keep recovery
+// active.
+func (sck *ShardCtrler) shouldRetryMigration(target *shardcfg.ShardConfig) bool {
+	current, _ := sck.mustReadConfig(currentConfigKey)
+	if current.Num >= target.Num {
+		return false
+	}
+
+	next, _, err := sck.readConfig(nextConfigKey)
+	if err == rpc.OK {
+		if next.Num > target.Num {
+			return false
+		}
+		if next.Num == target.Num {
+			if next.String() != target.String() {
+				return false
+			}
+			return true
+		}
+	}
+
+	return true
 }
 
 // Return the current configuration

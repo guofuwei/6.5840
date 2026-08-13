@@ -119,6 +119,7 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 		return nil, rpc.ErrWrongGroup
 	}
 	args := shardrpc.FreezeShardArgs{Shard: s, Num: num}
+	attempts := 0
 	for {
 		var reply shardrpc.FreezeShardReply
 		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.FreezeShard", &args, &reply)
@@ -126,9 +127,13 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 			if reply.Err == rpc.OK {
 				return reply.State, rpc.OK
 			}
-			if reply.Err == rpc.ErrWrongGroup {
-				return nil, rpc.ErrWrongGroup
+			if reply.Err == rpc.ErrWrongGroup || reply.Err == rpc.ErrStaleConfig {
+				return nil, reply.Err
 			}
+		}
+		attempts++
+		if attempts >= len(ck.servers) {
+			return nil, rpc.ErrWrongLeader
 		}
 		ck.nextServer()
 		time.Sleep(10 * time.Millisecond)
@@ -140,6 +145,7 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 		return rpc.ErrWrongGroup
 	}
 	args := shardrpc.InstallShardArgs{Shard: s, State: state, Num: num}
+	attempts := 0
 	for {
 		var reply shardrpc.InstallShardReply
 		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.InstallShard", &args, &reply)
@@ -147,9 +153,13 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 			if reply.Err == rpc.OK {
 				return rpc.OK
 			}
-			if reply.Err == rpc.ErrWrongGroup {
-				return rpc.ErrWrongGroup
+			if reply.Err == rpc.ErrWrongGroup || reply.Err == rpc.ErrStaleConfig {
+				return reply.Err
 			}
+		}
+		attempts++
+		if attempts >= len(ck.servers) {
+			return rpc.ErrWrongLeader
 		}
 		ck.nextServer()
 		time.Sleep(10 * time.Millisecond)
@@ -161,6 +171,7 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		return rpc.ErrWrongGroup
 	}
 	args := shardrpc.DeleteShardArgs{Shard: s, Num: num}
+	attempts := 0
 	for {
 		var reply shardrpc.DeleteShardReply
 		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.DeleteShard", &args, &reply)
@@ -168,9 +179,13 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 			if reply.Err == rpc.OK {
 				return rpc.OK
 			}
-			if reply.Err == rpc.ErrWrongGroup {
-				return rpc.ErrWrongGroup
+			if reply.Err == rpc.ErrWrongGroup || reply.Err == rpc.ErrStaleConfig {
+				return reply.Err
 			}
+		}
+		attempts++
+		if attempts >= len(ck.servers) {
+			return rpc.ErrWrongLeader
 		}
 		ck.nextServer()
 		time.Sleep(10 * time.Millisecond)

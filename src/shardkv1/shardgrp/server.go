@@ -106,7 +106,7 @@ func (kv *KVServer) DoOp(req any) any {
 		reply := &shardrpc.FreezeShardReply{Num: shard.Num}
 
 		if args.Num < shard.Num {
-			reply.Err = rpc.ErrWrongGroup
+			reply.Err = rpc.ErrStaleConfig
 			return reply
 		}
 		if args.Num == shard.Num {
@@ -145,7 +145,7 @@ func (kv *KVServer) DoOp(req any) any {
 		defer kv.mu.Unlock()
 		shard := &kv.shards[args.Shard]
 		if args.Num < shard.Num {
-			return &shardrpc.InstallShardReply{Err: rpc.ErrWrongGroup}
+			return &shardrpc.InstallShardReply{Err: rpc.ErrStaleConfig}
 		}
 		if args.Num == shard.Num {
 			if shard.Status == shardServing {
@@ -164,7 +164,7 @@ func (kv *KVServer) DoOp(req any) any {
 		defer kv.mu.Unlock()
 		shard := &kv.shards[args.Shard]
 		if args.Num < shard.Num {
-			return &shardrpc.DeleteShardReply{Err: rpc.ErrWrongGroup}
+			return &shardrpc.DeleteShardReply{Err: rpc.ErrStaleConfig}
 		}
 		if args.Num > shard.Num || shard.Status == shardServing {
 			return &shardrpc.DeleteShardReply{Err: rpc.ErrWrongGroup}
